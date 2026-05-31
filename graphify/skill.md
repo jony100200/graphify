@@ -1,6 +1,6 @@
 ---
 name: graphify
-description: any input (code, docs, papers, images) → knowledge graph → clustered communities → HTML + JSON + audit report
+description: "any input (code, docs, papers, images) - knowledge graph - clustered communities - HTML + JSON + audit report"
 trigger: /graphify
 ---
 
@@ -62,16 +62,24 @@ Follow these steps in order. Do not skip steps.
 ### Step 1 - Ensure graphify is installed
 
 ```bash
-# Detect the correct Python interpreter (handles pipx, venv, system installs)
+# Detect the correct Python interpreter (handles uv tool, pipx, venv, system installs)
+PYTHON=""
 GRAPHIFY_BIN=$(which graphify 2>/dev/null)
-if [ -n "$GRAPHIFY_BIN" ]; then
-    PYTHON=$(head -1 "$GRAPHIFY_BIN" | tr -d '#!')
-    case "$PYTHON" in
-        *[!a-zA-Z0-9/_.-]*) PYTHON="python3" ;;
-    esac
-else
-    PYTHON="python3"
+# 1. uv tool installs — most reliable on modern Mac/Linux
+if [ -z "$PYTHON" ] && command -v uv >/dev/null 2>&1; then
+    _UV_PY=$(uv tool run graphifyy python -c "import sys; print(sys.executable)" 2>/dev/null)
+    if [ -n "$_UV_PY" ]; then PYTHON="$_UV_PY"; fi
 fi
+# 2. Read shebang from graphify binary (pipx and direct pip installs)
+if [ -z "$PYTHON" ] && [ -n "$GRAPHIFY_BIN" ]; then
+    _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | tr -d '#!')
+    case "$_SHEBANG" in
+        *[!a-zA-Z0-9/_.-]*) ;;
+        *) "$_SHEBANG" -c "import graphify" 2>/dev/null && PYTHON="$_SHEBANG" ;;
+    esac
+fi
+# 3. Fall back to python3
+if [ -z "$PYTHON" ]; then PYTHON="python3"; fi
 "$PYTHON" -c "import graphify" 2>/dev/null || "$PYTHON" -m pip install graphifyy -q 2>/dev/null || "$PYTHON" -m pip install graphifyy -q --break-system-packages 2>&1 | tail -3
 # Write interpreter path for all subsequent steps (persists across invocations)
 mkdir -p graphify-out
@@ -185,7 +193,7 @@ for f in detect.get('files', {}).get('code', []):
     code_files.extend(collect_files(Path(f)) if Path(f).is_dir() else [Path(f)])
 
 if code_files:
-    result = extract(code_files)
+    result = extract(code_files, cache_root=Path('.'))
     Path('graphify-out/.graphify_ast.json').write_text(json.dumps(result, indent=2))
     print(f'AST: {len(result[\"nodes\"])} nodes, {len(result[\"edges\"])} edges')
 else:
@@ -299,8 +307,10 @@ confidence_score is REQUIRED on every edge - never omit it, never use 0.5 as a d
   Weak or speculative: 0.4-0.5. Most edges should be 0.6-0.9, not 0.5.
 - AMBIGUOUS edges: 0.1-0.3
 
+Node ID format: lowercase, only `[a-z0-9_]`, no dots or slashes. Format: `{stem}_{entity}` where stem is the filename without extension and entity is the symbol name, both normalized (lowercase, non-alphanumeric chars replaced with `_`). Example: `src/auth/session.py` + `ValidateToken` → `session_validatetoken`. This must match the ID the AST extractor generates so cross-references between code and semantic nodes connect correctly.
+
 Output exactly this JSON (no other text):
-{"nodes":[{"id":"filestem_entityname","label":"Human Readable Name","file_type":"code|document|paper|image","source_file":"relative/path","source_location":null,"source_url":null,"captured_at":null,"author":null,"contributor":null}],"edges":[{"source":"node_id","target":"node_id","relation":"calls|implements|references|cites|conceptually_related_to|shares_data_with|semantically_similar_to|rationale_for","confidence":"EXTRACTED|INFERRED|AMBIGUOUS","confidence_score":1.0,"source_file":"relative/path","source_location":null,"weight":1.0}],"hyperedges":[{"id":"snake_case_id","label":"Human Readable Label","nodes":["node_id1","node_id2","node_id3"],"relation":"participate_in|implement|form","confidence":"EXTRACTED|INFERRED","confidence_score":0.75,"source_file":"relative/path"}],"input_tokens":0,"output_tokens":0}
+{"nodes":[{"id":"session_validatetoken","label":"Human Readable Name","file_type":"code|document|paper|image","source_file":"relative/path","source_location":null,"source_url":null,"captured_at":null,"author":null,"contributor":null}],"edges":[{"source":"node_id","target":"node_id","relation":"calls|implements|references|cites|conceptually_related_to|shares_data_with|semantically_similar_to|rationale_for","confidence":"EXTRACTED|INFERRED|AMBIGUOUS","confidence_score":1.0,"source_file":"relative/path","source_location":null,"weight":1.0}],"hyperedges":[{"id":"snake_case_id","label":"Human Readable Label","nodes":["node_id1","node_id2","node_id3"],"relation":"participate_in|implement|form","confidence":"EXTRACTED|INFERRED","confidence_score":0.75,"source_file":"relative/path"}],"input_tokens":0,"output_tokens":0}
 ```
 
 **Step B3 - Collect, cache, and merge**
@@ -540,8 +550,30 @@ G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
 
-if G.number_of_nodes() > 5000:
-    print(f'Graph has {G.number_of_nodes()} nodes - too large for HTML viz. Use Obsidian vault instead.')
+NODE_LIMIT = 5000
+if G.number_of_nodes() > NODE_LIMIT:
+    from collections import Counter
+    print(f'Graph has {G.number_of_nodes()} nodes (above {NODE_LIMIT} limit). Building aggregated community view...')
+    node_to_community = {nid: cid for cid, members in communities.items() for nid in members}
+    import networkx as nx_meta
+    meta = nx_meta.Graph()
+    for cid, members in communities.items():
+        meta.add_node(str(cid), label=labels.get(cid, f'Community {cid}'))
+    edge_counts = Counter()
+    for u, v in G.edges():
+        cu, cv = node_to_community.get(u), node_to_community.get(v)
+        if cu is not None and cv is not None and cu != cv:
+            edge_counts[(min(cu, cv), max(cu, cv))] += 1
+    for (cu, cv), w in edge_counts.items():
+        meta.add_edge(str(cu), str(cv), weight=w, relation=f'{w} cross-community edges', confidence='AGGREGATED')
+    if meta.number_of_nodes() > 1:
+        meta_communities = {cid: [str(cid)] for cid in communities}
+        member_counts = {cid: len(members) for cid, members in communities.items()}
+        to_html(meta, meta_communities, 'graphify-out/graph.html', community_labels=labels or None, member_counts=member_counts)
+        print(f'graph.html written (aggregated: {meta.number_of_nodes()} community nodes, {meta.number_of_edges()} cross-community edges)')
+        print('Tip: run with --obsidian for full node-level detail.')
+    else:
+        print('Single community — aggregated view not useful. Skipping graph.html.')
 else:
     to_html(G, communities, 'graphify-out/graph.html', community_labels=labels or None)
     print('graph.html written - open in any browser, no server needed')
@@ -736,7 +768,7 @@ cost_path.write_text(json.dumps(cost, indent=2))
 print(f'This run: {input_tok:,} input tokens, {output_tok:,} output tokens')
 print(f'All time: {cost[\"total_input_tokens\"]:,} input, {cost[\"total_output_tokens\"]:,} output ({len(cost[\"runs\"])} runs)')
 "
-rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_analysis.json graphify-out/.graphify_labels.json
+rm -f graphify-out/.graphify_detect.json graphify-out/.graphify_extract.json graphify-out/.graphify_ast.json graphify-out/.graphify_semantic.json graphify-out/.graphify_analysis.json graphify-out/.graphify_labels.json graphify-out/.graphify_chunk_*.json
 rm -f graphify-out/.needs_update 2>/dev/null || true
 ```
 
@@ -860,6 +892,17 @@ if deleted:
 # Merge: new nodes/edges into existing graph
 G_existing.update(G_new)
 print(f'Merged: {G_existing.number_of_nodes()} nodes, {G_existing.number_of_edges()} edges')
+
+# Write merged result back to .graphify_extract.json so Step 4 sees the full graph
+merged_out = {
+    'nodes': [{'id': n, **d} for n, d in G_existing.nodes(data=True)],
+    'edges': [{'source': u, 'target': v, **d} for u, v, d in G_existing.edges(data=True)],
+    'hyperedges': new_extraction.get('hyperedges', []),
+    'input_tokens': new_extraction.get('input_tokens', 0),
+    'output_tokens': new_extraction.get('output_tokens', 0),
+}
+Path('graphify-out/.graphify_extract.json').write_text(json.dumps(merged_out))
+print(f'[graphify update] Merged extraction written ({len(merged_out[\"nodes\"])} nodes, {len(merged_out[\"edges\"])} edges)')
 " 
 ```
 

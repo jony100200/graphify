@@ -1,6 +1,7 @@
 # git hook integration - install/uninstall graphify post-commit and post-checkout hooks
 from __future__ import annotations
 import re
+import subprocess
 from pathlib import Path
 
 _HOOK_MARKER = "# graphify-hook-start"
@@ -12,7 +13,10 @@ _PYTHON_DETECT = """\
 # Detect the correct Python interpreter (handles pipx, venv, system installs)
 GRAPHIFY_BIN=$(command -v graphify 2>/dev/null)
 if [ -n "$GRAPHIFY_BIN" ]; then
-    _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | sed 's/^#![[:space:]]*//')
+    case "$GRAPHIFY_BIN" in
+        *.exe) _SHEBANG="" ;;
+        *)     _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | sed 's/^#![[:space:]]*//') ;;
+    esac
     case "$_SHEBANG" in
         */env\\ *) GRAPHIFY_PYTHON="${_SHEBANG#*/env }" ;;
         *)         GRAPHIFY_PYTHON="$_SHEBANG" ;;
@@ -20,7 +24,7 @@ if [ -n "$GRAPHIFY_BIN" ]; then
     # Allowlist: only keep characters valid in a filesystem path to prevent
     # injection if the shebang contains shell metacharacters
     case "$GRAPHIFY_PYTHON" in
-        *[!a-zA-Z0-9/_.-]*) GRAPHIFY_PYTHON="" ;;
+        *[!a-zA-Z0-9/_.@-]*) GRAPHIFY_PYTHON="" ;;
     esac
     if [ -n "$GRAPHIFY_PYTHON" ] && ! "$GRAPHIFY_PYTHON" -c "import graphify" 2>/dev/null; then
         GRAPHIFY_PYTHON=""
@@ -42,6 +46,13 @@ _HOOK_SCRIPT = """\
 # graphify-hook-start
 # Auto-rebuilds the knowledge graph after each commit (code files only, no LLM needed).
 # Installed by: graphify hook install
+
+# Skip during rebase/merge/cherry-pick to avoid blocking --continue with unstaged changes
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null)
+[ -d "$GIT_DIR/rebase-merge" ] && exit 0
+[ -d "$GIT_DIR/rebase-apply" ] && exit 0
+[ -f "$GIT_DIR/MERGE_HEAD" ] && exit 0
+[ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] && exit 0
 
 CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only HEAD 2>/dev/null)
 if [ -z "$CHANGED" ]; then
@@ -92,6 +103,13 @@ if [ ! -d "graphify-out" ]; then
     exit 0
 fi
 
+# Skip during rebase/merge/cherry-pick
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null)
+[ -d "$GIT_DIR/rebase-merge" ] && exit 0
+[ -d "$GIT_DIR/rebase-apply" ] && exit 0
+[ -f "$GIT_DIR/MERGE_HEAD" ] && exit 0
+[ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] && exit 0
+
 """ + _PYTHON_DETECT + """
 echo "[graphify] Branch switched - rebuilding knowledge graph (code files)..."
 $GRAPHIFY_PYTHON -c "
@@ -115,6 +133,28 @@ def _git_root(path: Path) -> Path | None:
         if (parent / ".git").exists():
             return parent
     return None
+
+
+def _hooks_dir(root: Path) -> Path:
+    """Return the git hooks directory, respecting core.hooksPath if set (e.g. Husky)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "config", "core.hooksPath"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            custom = result.stdout.strip()
+            if custom:
+                p = Path(custom)
+                if not p.is_absolute():
+                    p = root / p
+                p.mkdir(parents=True, exist_ok=True)
+                return p
+    except (OSError, FileNotFoundError):
+        pass
+    d = root / ".git" / "hooks"
+    d.mkdir(exist_ok=True)
+    return d
 
 
 def _install_hook(hooks_dir: Path, name: str, script: str, marker: str) -> str:
@@ -158,8 +198,7 @@ def install(path: Path = Path(".")) -> str:
     if root is None:
         raise RuntimeError(f"No git repository found at or above {path.resolve()}")
 
-    hooks_dir = root / ".git" / "hooks"
-    hooks_dir.mkdir(exist_ok=True)
+    hooks_dir = _hooks_dir(root)
 
     commit_msg = _install_hook(hooks_dir, "post-commit", _HOOK_SCRIPT, _HOOK_MARKER)
     checkout_msg = _install_hook(hooks_dir, "post-checkout", _CHECKOUT_SCRIPT, _CHECKOUT_MARKER)
@@ -173,7 +212,7 @@ def uninstall(path: Path = Path(".")) -> str:
     if root is None:
         raise RuntimeError(f"No git repository found at or above {path.resolve()}")
 
-    hooks_dir = root / ".git" / "hooks"
+    hooks_dir = _hooks_dir(root)
     commit_msg = _uninstall_hook(hooks_dir, "post-commit", _HOOK_MARKER, _HOOK_MARKER_END)
     checkout_msg = _uninstall_hook(hooks_dir, "post-checkout", _CHECKOUT_MARKER, _CHECKOUT_MARKER_END)
 
@@ -185,7 +224,7 @@ def status(path: Path = Path(".")) -> str:
     root = _git_root(path)
     if root is None:
         return "Not in a git repository."
-    hooks_dir = root / ".git" / "hooks"
+    hooks_dir = _hooks_dir(root)
 
     def _check(name: str, marker: str) -> str:
         p = hooks_dir / name

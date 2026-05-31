@@ -51,7 +51,7 @@ def god_nodes(G: nx.Graph, top_n: int = 10) -> list[dict]:
         result.append({
             "id": node_id,
             "label": G.nodes[node_id].get("label", node_id),
-            "edges": deg,
+            "degree": deg,
         })
         if len(result) >= top_n:
             break
@@ -363,7 +363,7 @@ def suggest_questions(
     # 2. Bridge nodes (high betweenness) → cross-cutting concern questions
     if G.number_of_edges() > 0:
         k = min(100, G.number_of_nodes()) if G.number_of_nodes() > 1000 else None
-        betweenness = nx.betweenness_centrality(G, k=k)
+        betweenness = nx.betweenness_centrality(G, k=k, seed=42)
         # Top bridge nodes that are NOT file-level hubs
         bridges = sorted(
             [(n, s) for n, s in betweenness.items()

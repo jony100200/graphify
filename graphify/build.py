@@ -21,9 +21,20 @@
 #    before any graph construction happens.
 #
 from __future__ import annotations
+import re
 import sys
 import networkx as nx
 from .validate import validate_extraction
+
+
+def _normalize_id(s: str) -> str:
+    """Normalize an ID string the same way extract._make_id does.
+
+    Used to reconcile edge endpoints when the LLM generates IDs with slightly
+    different punctuation or casing than the AST extractor.
+    """
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", s)
+    return cleaned.strip("_").lower()
 
 
 def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
@@ -35,6 +46,12 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     # NetworkX <= 3.1 serialised edges as "links"; remap to "edges" for compatibility.
     if "edges" not in extraction and "links" in extraction:
         extraction = dict(extraction, edges=extraction["links"])
+
+    # Canonicalize legacy node/edge schema before validation.
+    for node in extraction.get("nodes", []):
+        if isinstance(node, dict) and "source" in node and "source_file" not in node:
+            node["source_file"] = node.pop("source")
+
     errors = validate_extraction(extraction)
     # Dangling edges (stdlib/external imports) are expected - only warn about real schema errors.
     real_errors = [e for e in errors if "does not match any node id" not in e]
@@ -44,6 +61,10 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     for node in extraction.get("nodes", []):
         G.add_node(node["id"], **{k: v for k, v in node.items() if k != "id"})
     node_set = set(G.nodes())
+    # Normalized ID map: lets edges survive when the LLM generates IDs with
+    # slightly different casing or punctuation than the AST extractor.
+    # e.g. "Session_ValidateToken" maps to "session_validatetoken".
+    norm_to_id: dict[str, str] = {_normalize_id(nid): nid for nid in node_set}
     for edge in extraction.get("edges", []):
         if "source" not in edge and "from" in edge:
             edge["source"] = edge["from"]
@@ -52,6 +73,11 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
         if "source" not in edge or "target" not in edge:
             continue
         src, tgt = edge["source"], edge["target"]
+        # Remap mismatched IDs via normalization before dropping the edge.
+        if src not in node_set:
+            src = norm_to_id.get(_normalize_id(src), src)
+        if tgt not in node_set:
+            tgt = norm_to_id.get(_normalize_id(tgt), tgt)
         if src not in node_set or tgt not in node_set:
             continue  # skip edges to external/stdlib nodes - expected, not an error
         attrs = {k: v for k, v in edge.items() if k not in ("source", "target")}
